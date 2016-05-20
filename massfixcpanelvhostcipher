@@ -1,0 +1,19 @@
+#!/bin/bash
+
+# Script to mass fix all cPanel users SSL ciphers
+# Because cPanel uses separate vhost templates
+# And those override the main
+
+for i in $(ls -lah /var/cpanel/userdata/*/*SSL | awk '{print $9}'); do 
+	if grep -q "sslciphersuite" $i 
+		then echo "Removing ciphers from $i..." 
+		sed -i '/sslciphersuite/d' $i
+ 		rm -f $i.cache
+	 fi 
+done
+
+/scripts/updateuserdatacache
+/scripts/updateuserdomains
+/scripts/rebuildhttpdconf
+service httpd restart
+service httpd status
