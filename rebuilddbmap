@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# Script for rebuilding the mysql DB map yaml
+# Makes them show up in the cPanel MySQL DB Page
+
+echo "cPanel User:"
+read BUSER && for db in $(sudo mysql -e  'show databases;' | grep $BUSER); do 
+	echo "Building database into yaml for $db..." 
+	sudo /usr/local/cpanel/bin/dbmaptool $BUSER --type mysql --dbs $db
+	echo "Done"
+done
