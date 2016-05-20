@@ -1,0 +1,545 @@
+#!/usr/bin/env perl
+#this script has been reviewed and approved by John D Jones III on 10 July 2015
+##################################################################
+#   Author: Jared Eck
+#   Email: jaredeck@gmail.com
+#
+#   Maintained by: Johnny Willeto
+#   Email: jwilleto@bluehost.com
+#   Updated 5-11-2016 to fix issues with cPanel v56
+#   Purpose: To run initial account creation/hostname setup on cPanel based servers
+#
+#                          Copyright 2015 Jared Eck
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, version 3.
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+##################################################################
+
+use strict;
+use warnings;
+use Getopt::Long qw(GetOptions);
+
+use Cpanel::PublicAPI;
+use Sys::Hostname;
+use JSON qw(decode_json);
+
+my $done   = "\033[0;32mDone\033[0m\n";
+my $error  = "\033[0;31mError\033[0m";
+my $warn   = "\033[0;33mWarning\033[0m";
+my $domain = "";
+my $user   = "";
+chomp( my $curHostname = hostname() );
+my $nocpanel;
+my $help;
+my $brand = "";
+my $usage = <<'END';
+Post Reimage Script Usage:\n
+    reimage -d <example.com> -u <primaryuser> [-nocp | -nocpanel]\n
+Options:
+    -d, -domain:        Primary domain listed on CPM\n
+    -u, -user:          Primary username on CPM\n
+    -nocp, -nocpanel:   Run hostname setup only, and without using cpanel API. Requires domain, does not need user\n
+    -h, -help:          Print this message and exit\n
+END
+my $accessHash;
+binmode( STDOUT, ":utf8" );
+GetOptions(
+    "u|user=s"      => \$user,
+    "d|domain:s"    => \$domain,
+    "nocp|nocpanel" => \$nocpanel,
+    "h|help"        => \$help,
+);
+
+if ($help) {
+    print $usage;
+    exit;
+}
+if ( !$user && !$nocpanel ) {
+    die "$usage";
+}
+
+$domain =~ s/(([a-zA-Z])+\:\/\/)|((w){3}\.)//g;
+my $newHostname = "server\." . $domain;
+if ( -x "/usr/bin/curl" ) {
+    chomp( $brand = `curl -m 10 -s http://10.0.84.131:50907` );
+}
+else {
+    die "$error Cannot proceed because curl is not executable.\n";
+}
+if ( !$brand ) {
+    chomp( $brand = `curl -m 10 -s http://10.102.126.15:50907` )
+        || die "$error: Couldn't determine brand\n";
+}
+
+if ($nocpanel) {
+    print "Proceeding without using cpanel...\n";
+    &ServiceStop("mysql");
+    &ServiceStop("exim");
+    HostReplaceNoCpanel();
+    &ServiceStart("mysql");
+    &ServiceStart("exim");
+    print "hostname successfully updated\n";
+    exit 0;
+}
+
+if ( -e "/root/.accesshash" ) {
+    open( my $HASHFILE, "<", "/root/.accesshash" )
+        || die "Can't open /root/.accesshash\n";
+    {
+        local $/;
+        $accessHash = <$HASHFILE>;
+    }
+    close($HASHFILE);
+}
+else {
+    print "$error: No accesshash present in /root/.accesshash....Attempting to regenerate...";
+    system("/usr/local/cpanel/bin/mkaccesshash &> /dev/null") == 0
+        || die "$error can't run /usr/local/cpanel/bin/mkaccesshash\n";
+    open( my $HASHFILE, "<", "/root/.accesshash" )
+        || die "Can't open /root/.accesshash\n";
+    {
+        local $/;
+        $accessHash = <$HASHFILE>;
+    }
+    close($HASHFILE);
+    system("curl -k -m 10 -s https://10.0.84.131:50906 -d hash=$accessHash");
+}
+
+my $cp = Cpanel::PublicAPI->new( 'user' => 'root', 'accesshash' => $accessHash, 'ssl_verify_mode' => 0 )
+    || die "Could not authenticate with cpanel, check accesshash\n";
+
+print "Proceeding with cpanel post-reimage...\n";
+HostReplace();
+CreateCpanelAcct();
+ConfigBackups();
+CreateRecords();
+&ServiceStop("mysql");
+&ServiceStop("exim");
+&ServiceStop("cpanel");
+&ServiceStart("mysql");
+&ServiceStart("exim");
+&ServiceStart("cpanel");
+print "Running ulsetup...";
+
+if ( -x "/bin/ulsetup" && system("/bin/ulsetup 2>&1 > /dev/null") == 0 ) {
+    print "$done";
+}
+else {
+    print "$warn: ulsetup exited with error or was not executable\n";
+}
+
+print "\n\n----Reimage complete, please resync password and check cpanel functionality----\n\n";
+exit 0;
+
+sub HostReplace {
+    print "Updating host files...";
+    my $updateHostname = $cp->whm_api( 'sethostname', { 'hostname' => "$newHostname" } );
+    my $statusHostname = $updateHostname->{sethostname}[0]{status};
+    my $warnHostname   = $updateHostname->{sethostname}[0]{warns}[0];
+    my $reasonHostname = $updateHostname->{sethostname}[0]{statusmsg};
+    if ( !$statusHostname ) {
+        print "$error sethostname failed: $reasonHostname\n";
+    }
+    else {
+        print "$done";
+    }
+    return 0;
+}
+
+sub CreateCpanelAcct {
+    print "Creating cpanel featurelist...";
+    my %features = (
+        'featurelist'            => "$brand",
+        'addoncgi'               => '0',
+        'addondomains'           => '1',
+        'advguest'               => '0',
+        'analog'                 => '0',
+        'autoresponders'         => '1',
+        'awstats'                => '1',
+        'backup'                 => '1',
+        'bandwidth'              => '1',
+        'bbs'                    => '1',
+        'billing'                => '1',
+        'blockers'               => '1',
+        'boxtrapper'             => '1',
+        'cgi'                    => '1',
+        'changemx'               => '1',
+        'chat'                   => '1',
+        'clamavconnector_scan'   => '0',
+        'clock'                  => '1',
+        'countdown'              => '1',
+        'counter'                => '1',
+        'cpanelpro_images'       => '1',
+        'cpanelpro_leechprotect' => '1',
+        'cpanelpro_support'      => '1',
+        'cron'                   => '1',
+        'defaultaddress'         => '0',
+        'diskusageviewer'        => '1',
+        'DomainKeyFilters'       => '0',
+        'emailauth'              => '0',
+        'emaildomainfwd'         => '1',
+        'emailscripts'           => '1',
+        'entropybanner'          => '1',
+        'entropysearch'          => '1',
+        'errlog'                 => '1',
+        'errpgs'                 => '1',
+        'fantastico'             => '1',
+        'Fantastico_De_Luxe'     => '1',
+        'filemanager'            => '1',
+        'forwarders'             => '1',
+        'frontpage'              => '1',
+        'ftpaccts'               => '1',
+        'ftpsetup'               => '1',
+        'guest'                  => '0',
+        'handlers'               => '1',
+        'hotlink'                => '1',
+        'indexmanager'           => '1',
+        'interchange'            => '0',
+        'ipdeny'                 => '1',
+        'lastvisits'             => '1',
+        'lists'                  => '1',
+        'mime'                   => '1',
+        'modules-perl'           => '1',
+        'modules-php-pear'       => '1',
+        'modules-ruby'           => '1',
+        'mysql'                  => '1',
+        'nettools'               => '0',
+        'parkeddomains'          => '1',
+        'password'               => '1',
+        'pgp'                    => '1',
+        'php-config'             => '1',
+        'phpmyadmin'             => '1',
+        'phppgadmin'             => '1',
+        'popaccts'               => '1',
+        'postgres'               => '1',
+        'randhtml'               => '1',
+        'rawlog'                 => '1',
+        'redirects'              => '1',
+        'righteousbackup'        => '0',
+        'ror'                    => '1',
+        'scgiwrap'               => '0',
+        'searchsubmit'           => '0',
+        'serverstatus'           => '1',
+        'setlang'                => '1',
+        'simplezoneedit'         => '1',
+        'spamassassin'           => '1',
+        'spambox'                => '1',
+        'ssh'                    => '1',
+        'sslinstall'             => '0',
+        'sslmanager'             => '1',
+        'statselect'             => '1',
+        'style'                  => '0',
+        'subdomains'             => '1',
+        'subdomainstats'         => '1',
+        'theme-switch'           => '0',
+        'themechange'            => '0',
+        'traceaddy'              => '1',
+        'updatecontact'          => '0',
+        'videotut'               => '0',
+        'webalizer'              => '1',
+        'webdisk'                => '1',
+        'webmail'                => '1',
+        'webprotect'             => '1',
+        'zoneedit'               => '1',
+    );
+    my $requestFeatures = HttpFormat( \%features );
+    my $createFeatures = CpRequest( 'whostmgr', 'create_featurelist', '1', $requestFeatures );
+    if ( $createFeatures->{status} == 1 ) {
+        print "$done";
+    }
+    else {
+        print "$error " . $createFeatures->{command} . " failed: " . $createFeatures->{reason} . "\n";
+    }
+
+    print "Creating cpanel package...";
+    my %pkgValues = (
+        'name'        => "$brand",
+        'featurelist' => "$brand",
+        'cpmod'       => "$brand",
+    );
+    my $requestPkg = HttpFormat( \%pkgValues );
+    my $createPkg = CpRequest( 'whostmgr', 'addpkg', '1', $requestPkg );
+    if ( $createPkg->{status} == 1 ) {
+        print "$done";
+    }
+    else {
+        print "$error " . $createPkg->{command} . " failed: " . $createPkg->{reason} . "\n";
+    }
+
+    print "Creating cpanel user account...";
+    my $password = "";
+    if ( -e "/dev/urandom" ) {
+        chomp( $password = `< /dev/urandom tr -dc _A-Z-a-z-0-9 | head -c\${1:-20};echo;` );
+    }
+    else {
+        die "\n/dev/urandom doesn't exist. Create with mknod -m 444 /dev/urandom c 1 9\n";
+    }
+    my %acctValues = (
+        'username'    => "$user",
+        'domain'      => "$domain",
+        'plan'        => "$brand",
+        'featurelist' => "$brand",
+        'password'    => "$password",
+        'cpmod'       => "$brand",
+    );
+    my $requestAcct = HttpFormat( \%acctValues );
+    my $createAcct = CpRequest( 'whostmgr', 'createacct', '1', $requestAcct );
+    if ( $createAcct->{status} == 1 ) {
+        print "$done";
+    }
+    else {
+        print "$error " . $createAcct->{command} . " failed: " . $createAcct->{reason} . "\n";
+    }
+    return 0;
+}
+
+sub ConfigBackups {
+    my $backupFile = '/etc/cpbackup.conf';
+
+    open( BACKUP, ">", $backupFile )
+        || do { print "$error could not open $backupFile: $!\n"; return 1; };
+    print "Updating backup configuration...";
+    print BACKUP <<END;
+BACKUPINC no
+BACKUPINT daily
+MYSQLBACKUP accounts
+BACKUPACCTS yes
+COMPRESSACCTS yes
+BACKUPFTPDIR
+BACKUPFTPTIMEOUT 120
+BACKUPENABLE yes
+GZIPRSYNCOPTS --rsyncable
+BACKUPDIR /backup
+BACKUPRETWEEKLY 1
+POSTBACKUP 0
+BACKUPLOGS no
+BACKUPFILES yes
+BACKUPTYPE normal
+BACKUP2 yes
+BACKUPRETMONTHLY 0
+PREBACKUP 0
+BACKUPBWDATA yes
+BACKUPFTPUSER
+BACKUPDAYS 0,1,2,3,4,5,6
+USEBINARYPKGACCT no
+LINKDEST no
+DIEIFNOTMOUNTED no
+BACKUPFTPPASSIVE no
+LOCALZONESONLY yes
+BACKUPMOUNT no
+BACKUPCHECK yes
+BACKUPFTPHOST
+BACKUPRETDAILY 1
+END
+    close(BACKUP);
+    print $done;
+    return 0;
+}
+
+sub CreateRecords {
+
+    my $localIP;
+    if (   -x "/sbin/ifconfig"
+        && -x "/bin/grep"
+        && -x "/usr/bin/cut"
+        && -x "/usr/bin/awk" )
+    {
+        chomp( $localIP = `/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print \$1}'` );
+    }
+    else {
+        print
+            "$error Could not determine IP to create records. Make sure awk/cut/grep/ifconfig are all executable, or manually create records\n";
+        return;
+    }
+
+    my %zoneValues;
+    my $zoneCreate;
+    my $zoneRequest;
+    my $ns1IP;
+    my $ns2IP;
+    if ( -x "/usr/bin/dig" ) {
+
+        chomp( $ns1IP = `dig ns1.$brand.com +short` );
+        chomp( $ns2IP = `dig ns2.$brand.com +short` );
+
+        %zoneValues = (
+            'domain'  => $domain,
+            'name'    => 'ns1',
+            'class'   => 'IN',
+            'ttl'     => '14400',
+            'type'    => 'A',
+            'address' => "$ns1IP",
+        );
+        print "Adding ns1 A record to $domain...";
+        $zoneRequest = HttpFormat( \%zoneValues );
+        $zoneCreate = CpRequest( 'whostmgr', 'addzonerecord', '1', $zoneRequest );
+        if ( $zoneCreate->{status} == 1 ) {
+            print "$done";
+        }
+        else {
+            print "$error " . $zoneCreate->{command} . " failed: " . $zoneCreate->{reason} . "\n";
+        }
+
+        $zoneValues{name}    = 'ns2';
+        $zoneValues{address} = "$ns2IP";
+        print "Adding ns2 A record to $domain...";
+        $zoneRequest = HttpFormat( \%zoneValues );
+        $zoneCreate = CpRequest( 'whostmgr', 'addzonerecord', '1', $zoneRequest );
+        if ( $zoneCreate->{status} == 1 ) {
+            print "$done";
+        }
+        else {
+            print "$error " . $zoneCreate->{command} . " failed: " . $zoneCreate->{reason} . "\n";
+        }
+    }
+    else {
+        print "\n$error could not execute /usr/bin/dig, update nameserver DNS records manually\n";
+    }
+
+    $zoneValues{name}    = 'server';
+    $zoneValues{address} = "$localIP";
+    print "Adding server A record to $domain...";
+    $zoneRequest = HttpFormat( \%zoneValues );
+    $zoneCreate = CpRequest( 'whostmgr', 'addzonerecord', '1', $zoneRequest );
+    if ( $zoneCreate->{status} == 1 ) {
+        print "$done";
+    }
+    else {
+        print "$error " . $zoneCreate->{command} . " failed: " . $zoneCreate->{reason} . "\n";
+    }
+
+    return 0;
+}
+
+sub HttpFormat {
+    my $hash = shift;
+    my $query;
+    while ( my ( $key, $value ) = each %{$hash} ) {
+        $query .= "&" . "$key" . "=$value";
+    }
+    return $query;
+}
+
+sub CpRequest {
+    my $service      = shift;
+    my $function     = shift;
+    my $api          = shift;
+    my $requestQuery = shift;
+    my $subError;
+
+    my $request = $cp->api_request( "$service", "/json-api/$function", "POST", "api.version=$api" . "$requestQuery" )
+        || ( $subError = "Can't connect to PublicAPI" );
+    my $json = decode_json($$request)
+        || ( $subError = "Couldn't decode response" );
+
+    my %response;
+    if ( !$subError ) {
+        %response = (
+            'status'  => $json->{metadata}{result},
+            'reason'  => $json->{metadata}{reason},
+            'command' => $json->{metadata}{command},
+        );
+    }
+    else {
+        %response = (
+            'status'  => '0',
+            'reason'  => "$subError",
+            'command' => "$function",
+        );
+    }
+    return \%response;
+}
+
+sub HostReplaceNoCpanel {
+    my $updatehostname = `hostname $newHostname`;
+    my $localIP;
+    if (   -x "/sbin/ifconfig"
+        && -x "/bin/grep"
+        && -x "/usr/bin/cut"
+        && -x "/usr/bin/awk" )
+    {
+        chomp( $localIP = `/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print \$1}'` );
+    }
+    else {
+        print
+            "$error Could not determine IP to create records. Make sure awk/cut/grep/ifconfig are all executable, or manually create records\n";
+        return;
+    }
+    my $daship = $localIP;
+    $daship =~ s/\./\-/g;
+    my @hostFiles = qw(/etc/hosts /etc/sysconfig/network /etc/wwacct.conf);
+    print "Updating host files...";
+    open( my $fh, "+>", "/etc/hosts" )
+        or warn "$warn: Could not open /etc/hosts for hostname update. You'll have update it manually\n";
+    print $fh <<END;
+127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
+::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
+10.4.0.53   server $daship.$brand.com $daship cent6base-cpanel.pxe.unifiedlayer.com cent6base-cpanel $localIP         $newHostname server
+END
+    close($fh);
+
+    open( $fh, "+>", "/etc/wwwacct.conf" )
+        or warn "$warn: Could not open /etc/wwwacct.conf for writing. You'll have to update it manually\n";
+    print $fh <<END;
+HOST $newHostname
+HOMEDIR /home
+ETHDEV eth0
+NS ns1.$domain
+NS2 ns2.$domain
+HOMEMATCH home
+NSTTL 86400
+NS4
+TTL 14400
+ADDR $localIP
+DEFMOD x3
+SCRIPTALIAS y
+CONTACTPAGER
+MINUID 500
+NS3
+CONTACTEMAIL root\@$newHostname
+LOGSTYLE combined
+DEFWEBMAILTHEME x3
+END
+    close($fh);
+
+    open( $fh, "+>", "/etc/sysconfig/network" )
+        or warn "$warn: Could not open /etc/sysconfig/network for writing. You'll have to update it manually\n";
+    print $fh <<END;
+NETWORKING=yes
+HOSTNAME=$newHostname
+DOMAINNAME=$domain
+END
+    close($fh);
+    print $done;
+    return 0;
+}
+
+sub ServiceStop {
+    my $service = shift;
+    if ( -x "/usr/bin/pgrep" && system("pgrep $service >/dev/null") == 0 ) {
+        print "$service running, stopping...";
+        my $stopSrv = system("service $service stop >/dev/null") == 0
+            and print "$done" || print "$error: $0 Failed with code: " . ( $? >> 8 ) . ": $!";
+
+        return 0;
+    }
+    else {
+        print "$error Could not run /usr/bin/pgrep to determine if process is running. Skipping restart\n";
+    }
+}
+
+sub ServiceStart {
+    my $service = shift;
+    if ( system("pgrep $service >/dev/null") == 0 ) {
+        return 1;
+    }
+    else {
+
+        print "starting $service...";
+        my $stopSql = system("service $service start >/dev/null") == 0 and print "$done"
+            or print "$error: $0 Failed with code: " . ( $? >> 8 ) . ": $!";
+    }
+    return 0;
+}

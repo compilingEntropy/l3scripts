@@ -1,0 +1,12 @@
+#!/bin/bash
+
+echo "Easy script for adding ips automagically to /etc/ips"
+echo "Add them one at a time"
+echo "Quit out with ^c then restart ipaliases when done"
+
+while true; do 
+printf 'Enter an IP: ' 
+read -r IP 
+ipcalc -b $IP -m 255.255.224.0 | awk -F"=" -vv="${IP}" 'BEGIN {pre=""} {if ($1 == pre || NR ==1) { printf v ":%s:", $2 } else { pre = $1; printf "%s", $2}} END {printf "\n"}' 
+>> /etc/ips 
+done
