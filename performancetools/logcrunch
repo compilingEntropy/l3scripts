@@ -1,0 +1,180 @@
+#!/bin/bash
+function supersorted(){
+	sort $1 | uniq -c | sort -n | sed -e 's/^[ \t]*//' | tail -n 15 |  tac
+}
+
+function end(){
+	printf "END::$ID::$DOMAIN\n" >> "$RAWFILE"
+}
+
+function topuri(){
+	awk '{print $7}' "$1" | supersorted 
+}
+
+function topip(){
+	awk '{print $1}' "$1" | supersorted 
+}
+
+function topresp(){
+	awk '{print $9}' "$1" | supersorted
+}
+
+function topref(){
+	awk '{print $11}' "$1" | supersorted
+}
+
+
+RAWFILE="/usr/local/apache/htdocs/logcrunchraw.txt"
+TMPFILE="/tmp/log-crunch.txt"
+echo '' > "$RAWFILE"
+#cleanup
+rm -rf /usr/local/apache/htdocs/top*-*.txt
+rm -rf /usr/local/apache/htdocs/reqsph*-*.txt
+rm -rf /usr/local/apache/htdocs/logcrunch*.html
+#end cleanup
+
+touch "$TMPFILE"
+touch "$RAWFILE"
+
+
+
+limit="$2"
+day="$1"
+if [ ! -z "$day" ] 
+then
+	M=`echo "$day" | cut -d\/ -f2`
+	Y=`echo "$day" | cut -d\/ -f3`
+	logfiled=`echo "$day" | cut -d\/ -f1`
+	logfileMY=`printf "$M-$Y"`
+fi
+if [ -z "$day" ]
+then
+
+       day=`date +"%d/%b/%Y"`
+       printf "\nUsing today $day"
+       logfileMY=`date +"%b-%Y"`	
+       logfiled=`date +"%d"`
+fi
+
+echo "$logfileMY"
+
+if [ -z "$limit" ]
+	then 
+	limit=10 ;
+fi
+
+
+ID=0 ;
+for DOMAIN in `head -n -1 /etc/userdomains | cut -d: -f1`
+do 
+
+### Get raw access logs for the specified day and put them to a temp file. Much faster than running through the entire archive file 4 times ###
+
+CPUSER=`/scripts/whoowns "$DOMAIN"`
+
+if [  -s /home/"$CPUSER"/logs/"$DOMAIN"-"$logfileMY".gz ]
+then 
+	EXISTS=1
+	ls -alh /home/"$CPUSER"/logs/"$DOMAIN"-"$logfileMY".gz
+	zgrep "$day" /home/"$CPUSER"/logs/"$DOMAIN"-"$logfileMY".gz >> "$TMPFILE"
+	
+fi
+
+if  [  -s /usr/local/apache/domlogs/"$DOMAIN" ]
+then
+	ls -lah /usr/local/apache/domlogs/"$DOMAIN"
+	EXISTS=1
+	grep "$day" /usr/local/apache/domlogs/"$DOMAIN" >> "$TMPFILE"
+fi
+
+if  [  -s /usr/local/apache/domlogs/"$DOMAIN".bkup ]
+then
+        ls -lah /usr/local/apache/domlogs/"$DOMAIN".bkup
+        EXISTS=1
+        grep "$day" /usr/local/apache/domlogs/"$DOMAIN".bkup >> "$TMPFILE"
+fi
+
+if [ "$EXISTS" == 1 ]
+then
+	### End temp creation ###
+	printf "BEGINDOMAIN::$ID::$DOMAIN\n" >> "$RAWFILE"
+
+	###Top URIs ###
+	printf "BEGINTOPURI::$ID::$DOMAIN\n" >> "$RAWFILE"
+	
+	awk '{print $7}' "$TMPFILE" | supersorted >> "$RAWFILE"
+	awk '{print $7}' "$TMPFILE" | grep "wp-cron.php" | cut -d? -f1 | sort | uniq -c | sort -n | sed -e 's/^[ \t]*//' >> "$RAWFILE"
+	end ;
+	##End Top URIs ###
+
+
+
+	###Top IPs ###
+	printf "BEGINTOPIP::$ID::$DOMAIN\n" >> "$RAWFILE"
+	awk '{print $1}' "$TMPFILE" | supersorted >> "$RAWFILE"
+	
+	end
+	### End Top IPs ###
+
+
+	### Top Resp ###
+	printf "BEGINTOPRESP::$ID::$DOMAIN\n" >> "$RAWFILE"
+	awk '{print $9}' "$TMPFILE" | supersorted  >> "$RAWFILE"
+	end
+	### End Top Resp ###
+
+	
+        ### Top UserAgent ###
+        printf "BEGINTOPUSERAGENT::$ID::$DOMAIN\n" >> "$RAWFILE"
+        awk '{print $12 $13 $14 $15 $16}' $TMPFILE | supersorted >> "$RAWFILE"
+        end
+        ### End Top UserAgent ###
+
+        ### Begin Top referer ###
+        printf "BEGINTOPREF::$ID::$DOMAIN\n" >> "$RAWFILE"
+        awk '{print $11}' $TMPFILE | supersorted >> "$RAWFILE"
+        end
+        ### End Top referer ###
+
+
+
+
+	### Reqsph  ###
+	printf "BEGINREQSPH::$ID::$DOMAIN\n" >> "$RAWFILE"
+	hour=0
+	while [ $hour -lt 24 ]
+	do
+ 	printf "$hour: "  >> "$RAWFILE" ;
+  	if [ $hour -lt 10 ] ; then
+    
+    	zgrep "$day:0$hour" "$TMPFILE" | wc -l >> "$RAWFILE" ;
+  	else
+    	zgrep "$day:$hour" "$TMPFILE" | wc -l >> "$RAWFILE" ;
+  	fi
+	hour=$[$hour+1];
+	done
+	end
+	### End reqsph ###
+
+
+
+	### print a delineation for readability ###
+	printf "ENDDOMAIN::$ID::$DOMAIN\n" >> "$RAWFILE"
+
+
+	### Empty it out and move on ###
+	echo '' > "$TMPFILE"	
+	ID=$((ID+1))
+fi
+	EXISTS=0
+	done; 
+
+
+echo "BEGINDOMAIN::CPUUSAGE::SAR-Q" >> "$RAWFILE"
+sar -q -f /var/log/sa/sa"$logfiled" | egrep -v "Average|ldavg|Linux" | awk -v limit="$(nproc)" '{if ($5>=limit) print $1$2,$5}'  >> "$RAWFILE"
+printf "ENDDOMAIN::CPUUSAGE::SAR-Q" >> "$RAWFILE"
+
+
+cp -arf "$RAWFILE" /root
+
+printf "\nCheck or provide to customer: \n http://`hostname -i`/topresp-$(date +%d%m%y).txt \n http://`hostname -i`/topuri-$(date +%d%m%y).txt \n http://`hostname -i`/topip-$(date +%d%m%y).txt\nhttp://`hostname -i`/reqsph-$(date +%d%m%y).txt \nIf you see anything suspicous, dig a bit deeper in the appropriate log.\n"

@@ -1,0 +1,13 @@
+#!/bin/bash
+
+# Script for setting PHP and NGINX upload to 128M for OHWP
+
+php -i | egrep 'post_max_size|upload_max_filesize' --color
+sed -i '/post_max_size/s/[0-9]*M/128M/' /usr/local/lib/php.ini 
+sed -i '/upload_max_filesize/s/[0-9]*M/128M/' /usr/local/lib/php.ini
+service httpd restart
+php -i | egrep 'post_max_size|upload_max_filesize' --color
+
+sed -i '/client_max_body_size/s/[0-9]*M/128M/' /etc/nginx/nginx.conf
+service nginx restart
+grep client_max /etc/nginx/nginx.conf --color

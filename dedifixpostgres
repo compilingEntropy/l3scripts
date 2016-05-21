@@ -1,0 +1,127 @@
+#!/usr/bin/perl -w
+
+# Fix Postgres script for vps/dedi
+
+use strict;
+use Digest::MD5 qw(md5 md5_hex md5_base64);
+use File::Compare;
+
+print "Fixing Postgres \n";
+
+sub randomPassword {
+ my $password;
+ my $_rand;
+
+ my $password_length = $_[0];
+ if (!$password_length) {
+  $password_length = 10;
+ }
+
+ my @chars = split(" ",
+ "a b c d e f g h i j k l m n o
+  p q r s t u v w x y z - _ % # |
+  0 1 2 3 4 5 6 7 8 9");
+
+ srand;
+
+ for (my $i=0; $i <= $password_length ;$i++) {
+  $_rand = int(rand 41);
+  $password .= $chars[$_rand];
+ }
+ return $password;
+}
+
+my $passFile = ".pgpass";
+my $pgtop = "/root/.pgtop";
+my $globalPassFile = "/var/lib/pgsql/data/global/pg_pwd";
+my $psqlconf = "/var/lib/pgsql/data/pg_hba.conf";
+my $postgresconf = "/var/lib/pgsql/data/postgres.conf";
+my $psqltemp = "/etc/postgresql.conf.template";
+my $passwd = randomPassword(6);
+my $md5passwd = md5_hex($passwd."postgres");
+my $formatting = "*:*:*:postgres:";
+my $concat = "";
+
+# make sure postgresql.conf matches /etc/postgresql.conf.template
+if (-e $psqltemp){
+  unless (compare("$psqltemp","$postgresconf") == 0) {
+    system("/bin/cp -a -f --remove-destination $psqltemp $postgresconf");
+  }
+}
+
+#Add .pgtop to root here
+system ("touch $pgtop");
+open(DAT0,">$pgtop") || die("Cannot Open File");
+print DAT0 "user=postgres\npass=$passwd\nhost=localhost\ndb=template1\ndelay=5\nport=5432\nsocket=\nbatchmode=0\nheader=1\ncolor=1\nidle=1";
+close(DAT0);
+chmod 0600, $pgtop;
+
+#set postgres to trust from localhost so we can reset the password
+print "Setting to trust for postgres user to reset the password...\n";
+open (CONF, ">$psqlconf");
+print CONF "local\tpostgres\tall\ttrust\nlocal\tall\tall\ttrust\nhost\tall\tall\t127.0.0.1\t255.255.255.255\tmd5\n";
+close CONF;
+system("/etc/init.d/postgresql restart") == 0 or warn "Failed to restart: $!\n";
+
+#let things settle
+print "Sleeping for 10 to let things settle...\n";
+sleep 10;
+
+# update the postgres user's password inside of postgres
+system ("touch $globalPassFile");
+chdir "/var/lib/pgsql";
+my $psql_alter;
+$psql_alter = `psql -U postgres template1 -c \"alter user postgres with password 'md5$md5passwd';\"`;
+
+#chomp $psql_alter;
+if (!($psql_alter =~ /UPDATE 1|ALTER ROLE|ALTER USER/)){
+  warn "Error updating database: $psql_alter\n";
+}
+
+#fix all .pgpass files
+my $pgpassfile;
+foreach my $dir ("/root", "/var/lib/pgsql") {
+    $pgpassfile = "$dir/$passFile";
+    system ("touch $pgpassfile");
+    open(DAT,">$pgpassfile") || warn("Cannot Open $dir/$passFile: $!\n");
+    print DAT "$formatting$passwd\n"; 
+    close(DAT);
+    chmod 0600, $pgpassfile;
+}
+system("chown postgres.postgres /var/lib/pgsql/.pgpass");
+
+# Set PSQL access
+ my %pgwl;
+ if (-e "/etc/pgsql_whitelist"){
+   open(PGWL, "/etc/pgsql_whitelist") || warn "Unable to load /etc/pgsql_whitelist\n";
+    while(<PGWL>){
+     chomp();
+      if($_ =~ m/^(\w+)\:(\w+\_\w+)\:(\w+\_\w+)\:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|\d{1,3}\.\d{1,3}\.\d{1,3}\.0\/24)$/){
+       push( @{$pgwl{$1}}, "$2:$3:$4");
+      }
+    }
+   close(PGWL);
+ }
+system ("touch $psqlconf");
+open(DAT3,">$psqlconf") || warn("Cannot Open $psqlconf: $!\n");
+print DAT3 "local\tall\tall\tmd5\n\nhost\tall\tall\t127.0.0.1\t255.255.255.255\tmd5\n";
+print DAT3 "#--     Start Remote PostgreSQL     --\n";
+ foreach my $username (sort keys %pgwl){
+   foreach my $i ($pgwl{$username}){
+     foreach my $ent (@$i){
+       (my $db, my $usr, my $hst) = split(/:/, $ent);
+       if ( $hst =~ m/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/ ){
+         print DAT3 "host\t$db\t$usr\t$hst\t255.255.255.255\tmd5\n";
+       }
+       if ( $hst =~ m/^\d{1,3}\.\d{1,3}\.\d{1,3}\.0\/24$/ ){
+         print DAT3 "host\t$db\t$usr\t$hst\tmd5\n";
+       }
+     }
+   }
+ }
+ print DAT3 "#--     End Remote PostgreSQL     --\n";
+close(DAT3);
+chmod 0600, $psqlconf;
+system("chown postgres:postgres $psqlconf");
+print "Applying new settings...\n";
+system("/etc/init.d/postgresql restart") == 0 or warn "Failed to restart: $!\n";
